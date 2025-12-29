@@ -1,3 +1,14 @@
+"""
+arXiv ML Paper Fetcher - Strict Machine Learning Only
+
+This module fetches papers from arXiv with strict filtering to ensure
+only machine learning papers are collected. It uses multiple filters:
+1. Primary category must be cs.LG or stat.ML
+2. Excludes papers with non-ML categories (CV, NLP, Robotics, etc.)
+3. Requires ML-specific phrases in title/abstract
+4. Excludes papers with non-ML focus phrases
+"""
+
 import csv
 import html
 import re
@@ -17,32 +28,97 @@ EXCLUDE_CATS: Set[str] = {
     "cs.AI",  # AI (broad)
     "cs.RO",  # Robotics
     "cs.SI",  # Social and Information Networks
+    "cs.NE",  # Neural and Evolutionary Computing (often neuroscience-focused)
+    "cs.DS",  # Data Structures and Algorithms (too broad)
+    "cs.IT",  # Information Theory
+    "cs.SY",  # Systems and Control
     "q-bio",  # Biology umbrella (prefix match handled)
     "q-fin",  # Finance umbrella
     "econ",   # Economics umbrella
     "eess",   # Electrical Engineering umbrella
-    "physics" # Physics umbrella
+    "physics", # Physics umbrella
+    "math",   # Mathematics (too broad, unless specifically stat.ML)
 }
 
 REQUIRE_PHRASES: List[str] = [
+    # Core ML terms
     "machine learning",
     "deep learning",
     "neural network",
+    "neural networks",
     "representation learning",
     "supervised learning",
     "unsupervised learning",
     "reinforcement learning",
-    "bayesian",
+    "semi-supervised learning",
+    "transfer learning",
+    "meta-learning",
+    "few-shot learning",
+    # ML algorithms and methods
+    "gradient descent",
     "gradient",
+    "backpropagation",
+    "optimization",
+    "loss function",
+    "objective function",
+    "regularization",
+    "overfitting",
+    "generalization",
+    # Statistical learning
+    "bayesian",
+    "bayes",
+    "maximum likelihood",
+    "maximum a posteriori",
+    "empirical risk",
+    # Learning paradigms
+    "classification",
+    "regression",
+    "clustering",
+    "dimensionality reduction",
+    "feature learning",
+    "feature extraction",
+    # Model types
+    "support vector machine",
+    "svm",
+    "random forest",
+    "decision tree",
+    "ensemble",
+    "boosting",
+    "bagging",
 ]
 
 EXCLUDE_PHRASES: List[str] = [
+    # Review/survey papers
     "survey",
     "review",
     "tutorial",
     "a primer",
     "systematic review",
     "meta-analysis",
+    "literature review",
+    # Non-ML domains (that might appear in ML categories)
+    "quantum computing",
+    "quantum machine learning",  # Too specialized
+    "neuromorphic",
+    "neuromorphic computing",
+    "spiking neural",
+    "brain-computer interface",
+    "bci",
+    "neuroscience",
+    "cognitive science",
+    # Application domains that aren't core ML
+    "computer vision",
+    "image processing",
+    "natural language processing",
+    "nlp",
+    "speech recognition",
+    "robotics",
+    "autonomous",
+    # Hardware/implementation focused
+    "fpga",
+    "asic",
+    "hardware acceleration",
+    "edge computing",
 ]
 
 # ---------- LaTeX → readable (non-destructive) ----------
@@ -130,34 +206,47 @@ def clean_arxiv_text_readable(text: str) -> str:
 # ---------- arXiv parsing helpers ----------
 
 def get_primary_category(entry) -> Optional[str]:
+    """Extract primary category from arXiv entry."""
     pc = entry.get("arxiv_primary_category")
     return pc.get("term") if isinstance(pc, dict) else None
 
 
 def get_all_categories(entry) -> List[str]:
+    """Extract all categories from arXiv entry."""
     tags = entry.get("tags", [])
     return [t.get("term") for t in tags if isinstance(t, dict) and t.get("term")]
 
 
 def looks_strict_ml(title: str, abstract: str) -> bool:
+    """
+    Check if paper looks like strict ML based on required/excluded phrases.
+    Requires at least one ML-related phrase and excludes non-ML papers.
+    """
     text = (title + " " + abstract).lower()
-    if not any(p in text for p in REQUIRE_PHRASES):
+    
+    # Must have at least one ML-related phrase
+    has_ml_phrase = any(phrase in text for phrase in REQUIRE_PHRASES)
+    if not has_ml_phrase:
         return False
-    if any(p in text for p in EXCLUDE_PHRASES):
+    
+    # Must not have any exclusion phrases
+    has_exclusion = any(phrase in text for phrase in EXCLUDE_PHRASES)
+    if has_exclusion:
         return False
+    
     return True
 
 
 def is_excluded_category(all_cats: List[str]) -> bool:
+    """Check if any category is in the exclusion list."""
     for c in all_cats:
-        if c in EXCLUDE_CATS:
-            return True
-        if c.split(".")[0] in EXCLUDE_CATS:
+        if c in EXCLUDE_CATS or c.split(".")[0] in EXCLUDE_CATS:
             return True
     return False
 
 
 def get_pdf_link(entry) -> Optional[str]:
+    """Extract PDF link from arXiv entry."""
     for link in entry.get("links", []):
         if link.get("type") == "application/pdf":
             return link.get("href")
@@ -200,10 +289,12 @@ def fetch_strict_ml_only(
             if arxiv_id in seen_ids:
                 continue
 
+            # Strict filter 1: Primary category must be ML-only
             primary = get_primary_category(entry)
             if primary not in PRIMARY_ML:
                 continue
 
+            # Strict filter 2: No excluded categories in any category
             all_cats = get_all_categories(entry)
             if is_excluded_category(all_cats):
                 continue
@@ -214,6 +305,7 @@ def fetch_strict_ml_only(
             title = clean_arxiv_text_readable(raw_title)
             abstract = clean_arxiv_text_readable(raw_abstract)
 
+            # Strict filter 3: Must contain ML phrases and not contain exclusion phrases
             if not looks_strict_ml(title, abstract):
                 continue
 
@@ -222,6 +314,7 @@ def fetch_strict_ml_only(
             collected.append(
                 {
                     "id": arxiv_id,
+                    "category": primary or "",
                     "link": pdf_link or "",
                     "title": title,
                     "human_written_abstract": abstract,
@@ -239,8 +332,8 @@ def fetch_strict_ml_only(
 
 
 def save_csv(rows: List[Dict[str, str]], filename: str = "arxiv_strict_ml_100.csv") -> None:
-    fieldnames = ["id", "link", "title", "human_written_abstract"]
-    # utf-8-sig makes Excel open Unicode correctly
+    """Save rows to CSV file with UTF-8 BOM for Excel compatibility."""
+    fieldnames = ["id", "category", "link", "title", "human_written_abstract"]
     with open(filename, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_MINIMAL)
         writer.writeheader()

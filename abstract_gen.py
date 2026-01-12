@@ -77,7 +77,7 @@ def read_rows(path: str) -> List[Dict[str, str]]:
 
 def write_output(path: str, rows: List[Dict[str, str]]) -> None:
     with open(path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["title", "ai generated abstract"])
+        writer = csv.DictWriter(f, fieldnames=["title", "ai_generated_abstract"])
         writer.writeheader()
         writer.writerows(rows)
 
@@ -195,20 +195,20 @@ def main() -> int:
     for i, row in enumerate(input_rows, 1):
         title = (row.get("title") or "").strip()
         if not title:
-            out_rows.append({"title": "", "ai generated abstract": "ERROR: missing title"})
+            out_rows.append({"title": "", "ai_generated_abstract": "ERROR: missing title"})
             print(f"[{i}/{total}] SKIP missing title", file=sys.stderr)
             continue
 
         try:
             a1, a2 = generate_two_abstracts(title, api_key)
             combined = combine_same_cell(a1, a2)
-            out_rows.append({"title": title, "ai generated abstract": combined})
+            out_rows.append({"title": title, "ai_generated_abstract": combined})
             print(
                 f"[{i}/{total}] OK  WC1={word_count(a1)} WC2={word_count(a2)}",
                 file=sys.stderr,
             )
         except Exception as e:
-            out_rows.append({"title": title, "ai generated abstract": f"ERROR: {e}"})
+            out_rows.append({"title": title, "ai_generated_abstract": f"ERROR: {e}"})
             print(f"[{i}/{total}] FAIL {e}", file=sys.stderr)
 
         time.sleep(SLEEP_BETWEEN_REQUESTS)

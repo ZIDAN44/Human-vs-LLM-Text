@@ -130,23 +130,21 @@ def extract_text(resp: Dict) -> str:
     return content
 
 # ================= GENERATION =================
-def generate_abstracts(title: str, api_key: str, num_abstracts: int) -> List[str]:
-    """Generate N abstracts for a given title."""
+def generate_single_abstract(title: str, api_key: str) -> str:
+    """Generate a single abstract for a given title."""
     instructions = (
-        f"Generate {num_abstracts} abstracts for the given title.\n"
+        "Generate 1 abstract for the given title.\n"
         "Do not try to imitate the human writing style.\n"
-        "Each abstract must be written as one paragraph only.\n"
-        "Each abstract must be between 150 and 200 words.\n"
+        "The abstract must be written as one paragraph only.\n"
+        "The abstract must be between 150 and 200 words.\n"
     )
 
-    # Build schema dynamically
-    properties = {f"abstract_{i+1}": {"type": "string"} for i in range(num_abstracts)}
-    required = [f"abstract_{i+1}" for i in range(num_abstracts)]
-    
     schema = {
         "type": "object",
-        "properties": properties,
-        "required": required,
+        "properties": {
+            "abstract": {"type": "string"}
+        },
+        "required": ["abstract"],
         "additionalProperties": False,
     }
 
@@ -159,28 +157,35 @@ def generate_abstracts(title: str, api_key: str, num_abstracts: int) -> List[str
         "response_format": {
             "type": "json_schema",
             "json_schema": {
-                "name": "abstracts",
+                "name": "abstract",
                 "strict": True,
                 "schema": schema,
             }
         },
-        "max_tokens": 450 * num_abstracts,
+        "max_tokens": 450,
     }
 
     resp = call_openai(payload, api_key)
     data = json.loads(extract_text(resp))
+    
+    abstract = normalize_ws(data["abstract"])
+    # Enforce max length locally
+    if word_count(abstract) > MAX_WC:
+        abstract = trim_to_words(abstract, TARGET_WC)
+    else:
+        abstract = normalize_ws(ensure_sentence_end(abstract))
+    
+    return abstract
 
+def generate_abstracts(title: str, api_key: str, num_abstracts: int) -> List[str]:
+    """Generate N abstracts for a given title, each from a separate API call."""
     abstracts = []
     for i in range(num_abstracts):
-        key = f"abstract_{i+1}"
-        abstract = normalize_ws(data[key])
-        # Enforce max length locally
-        if word_count(abstract) > MAX_WC:
-            abstract = trim_to_words(abstract, TARGET_WC)
-        else:
-            abstract = normalize_ws(ensure_sentence_end(abstract))
+        abstract = generate_single_abstract(title, api_key)
         abstracts.append(abstract)
-
+        # Sleep between requests to avoid rate limiting
+        if i < num_abstracts - 1:  # Don't sleep after the last one
+            time.sleep(SLEEP_BETWEEN_REQUESTS)
     return abstracts
 
 def combine_same_cell(abstracts: List[str]) -> str:

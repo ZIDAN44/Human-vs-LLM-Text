@@ -53,7 +53,7 @@ This creates `arxiv_strict_ml_[n].csv` (e.g., `arxiv_strict_ml_100.csv`, `arxiv_
 
 ### Step 2: Generate AI Abstracts
 
-Generate AI abstracts for the papers:
+Generate AI abstracts for the papers. Each abstract is generated from a separate API call, then merged into a single CSV cell.
 
 ```bash
 python abstract_gen.py INPUT_CSV [OPTIONS]
@@ -67,7 +67,7 @@ python abstract_gen.py INPUT_CSV [OPTIONS]
 **Options:**
 
 - `-o, --output`: Output CSV filename (default: input filename with `_ai_abstracts` suffix)
-- `--batch-size`: Number of abstracts to generate before saving (default: 10). Useful for large batches to prevent data loss.
+- `--batch-size`: Number of papers to process before saving (default: 10). Useful for large batches to prevent data loss.
 
 **Examples:**
 
@@ -85,7 +85,7 @@ python abstract_gen.py arxiv_strict_ml_2000.csv -n 2 -o my_abstracts.csv
 python abstract_gen.py arxiv_strict_ml_2000.csv -n 5 --batch-size 20
 ```
 
-**Note:** The script saves abstracts incrementally in batches to prevent data loss. Progress is displayed with a progress bar showing completion percentage and save status.
+**Note:** Each abstract is generated from a separate API response. All abstracts for a paper are combined into one CSV cell. The script saves incrementally in batches to prevent data loss.
 
 ## Output
 
@@ -104,10 +104,10 @@ The filename reflects the number of papers fetched (e.g., `arxiv_strict_ml_50.cs
 Contains:
 
 - Paper titles
-- AI-generated abstracts (number specified by `-n/--num-abstracts`, combined in one cell)
+- AI-generated abstracts (number specified by `-n/--num-abstracts`, each from a separate API call, merged into one cell)
 
 ## Files
 
 - `arxiv.py` - Fetches ML papers from arXiv with strict filtering
-- `abstract_gen.py` - Generates AI abstracts using OpenAI API
+- `abstract_gen.py` - Generates AI abstracts using OpenAI API (one abstract per API call, merged into CSV)
 - `requirements.txt` - Python dependencies

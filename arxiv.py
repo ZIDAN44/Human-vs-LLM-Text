@@ -9,8 +9,10 @@ only machine learning papers are collected. It uses multiple filters:
 4. Excludes papers with non-ML focus phrases
 """
 
+import argparse
 import csv
 import html
+import os
 import re
 import time
 from typing import Dict, List, Optional, Set
@@ -256,19 +258,20 @@ def get_pdf_link(entry) -> Optional[str]:
 # ---------- main fetch + save ----------
 
 def fetch_strict_ml_only(
-    target_n: int = 100,
+    target_n: int,
     page_size: int = 200,
     sleep_seconds: float = 3.0,
     user_agent_email: str = "your_email@example.com",
-) -> List[Dict[str, str]]:
-    collected: List[Dict[str, str]] = []
+):
+    """Generator that yields ML papers one at a time."""
     seen_ids: Set[str] = set()
     start = 0
+    count = 0
 
     headers = {"User-Agent": f"strict-ml-only/1.0 (mailto:{user_agent_email})"}
     search_query = "(cat:cs.LG OR cat:stat.ML)"
 
-    while len(collected) < target_n:
+    while count < target_n:
         params = {
             "search_query": search_query,
             "start": start,
@@ -285,6 +288,9 @@ def fetch_strict_ml_only(
             break
 
         for entry in feed.entries:
+            if count >= target_n:
+                return
+
             arxiv_id = entry.id
             if arxiv_id in seen_ids:
                 continue
@@ -311,36 +317,96 @@ def fetch_strict_ml_only(
 
             pdf_link = get_pdf_link(entry)
 
-            collected.append(
-                {
-                    "id": arxiv_id,
-                    "category": primary or "",
-                    "link": pdf_link or "",
-                    "title": title,
-                    "human_written_abstract": abstract,
-                }
-            )
-            seen_ids.add(arxiv_id)
+            paper = {
+                "id": arxiv_id,
+                "category": primary or "",
+                "link": pdf_link or "",
+                "title": title,
+                "human_written_abstract": abstract,
+            }
 
-            if len(collected) >= target_n:
-                break
+            seen_ids.add(arxiv_id)
+            count += 1
+            yield paper
 
         start += page_size
         time.sleep(sleep_seconds)
 
-    return collected
 
-
-def save_csv(rows: List[Dict[str, str]], filename: str = "arxiv_strict_ml_100.csv") -> None:
-    """Save rows to CSV file with UTF-8 BOM for Excel compatibility."""
+def save_csv(rows: List[Dict[str, str]], filename: str = "arxiv_strict_ml_100.csv", append: bool = False) -> None:
+    """Save rows to CSV file with UTF-8 BOM for Excel compatibility.
+    
+    Args:
+        rows: List of paper dictionaries to save
+        filename: Output CSV filename
+        append: If True, append to existing file (skip header). If False, overwrite.
+    """
     fieldnames = ["id", "category", "link", "title", "human_written_abstract"]
-    with open(filename, "w", newline="", encoding="utf-8-sig") as f:
+    file_exists = os.path.exists(filename) and append
+    
+    mode = "a" if file_exists else "w"
+    with open(filename, mode, newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_MINIMAL)
-        writer.writeheader()
+        if not file_exists:
+            writer.writeheader()
         writer.writerows(rows)
 
 
 if __name__ == "__main__":
-    papers = fetch_strict_ml_only(target_n=100)
-    save_csv(papers, "arxiv_strict_ml_100.csv")
-    print(f"Saved {len(papers)} papers -> arxiv_strict_ml_100.csv")
+    parser = argparse.ArgumentParser(
+        description="Fetch strict ML papers from arXiv"
+    )
+    parser.add_argument(
+        "n",
+        type=int,
+        help="Number of papers to fetch"
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=50,
+        help="Number of papers to collect before saving to CSV (default: 50)"
+    )
+    args = parser.parse_args()
+    
+    target_n = args.n
+    batch_size = args.batch_size
+    filename = f"arxiv_strict_ml_{target_n}.csv"
+    
+    # Remove existing file if it exists to start fresh
+    if os.path.exists(filename):
+        os.remove(filename)
+    
+    collected: List[Dict[str, str]] = []
+    total_saved = 0
+    count = 0
+    bar_length = 40
+    
+    print(f"Fetching {target_n} papers (saving every {batch_size} papers)...\n")
+    
+    for paper in fetch_strict_ml_only(target_n):
+        collected.append(paper)
+        count += 1
+        
+        # Show progress
+        percentage = (count / target_n) * 100
+        filled = int(bar_length * count / target_n)
+        bar = "█" * filled + "░" * (bar_length - filled)
+        print(f"\rProgress: [{bar}] {count}/{target_n} ({percentage:.1f}%)", end="", flush=True)
+        
+        # Save incrementally when batch size is reached
+        if len(collected) >= batch_size:
+            save_csv(collected, filename, append=True)
+            total_saved += len(collected)
+            print(f" | Saved: {total_saved}")
+            collected = []
+    
+    # Save any remaining papers
+    if collected:
+        save_csv(collected, filename, append=True)
+        total_saved += len(collected)
+    
+    # Final progress bar
+    bar = "█" * bar_length
+    print(f"\rProgress: [{bar}] {count}/{target_n} (100.0%) | Saved: {total_saved}")
+    print(f"\nCompleted! Saved {total_saved} papers -> {filename}")

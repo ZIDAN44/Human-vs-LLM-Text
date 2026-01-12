@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import os
@@ -17,9 +18,6 @@ load_dotenv()
 # ================= CONFIG =================
 MODEL = "gpt-4o-mini"
 ENDPOINT = "https://api.openai.com/v1/chat/completions"
-
-INPUT_CSV = "arxiv_strict_ml_100.csv"
-OUTPUT_CSV = "arxiv_strict_ml_ai_abstracts.csv"
 
 MIN_WC = 150
 MAX_WC = 200
@@ -75,10 +73,16 @@ def read_rows(path: str) -> List[Dict[str, str]]:
     except FileNotFoundError:
         raise FileNotFoundError(f"Input file not found: {path}")
 
-def write_output(path: str, rows: List[Dict[str, str]]) -> None:
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["title", "ai_generated_abstract"])
-        writer.writeheader()
+def write_output(path: str, rows: List[Dict[str, str]], append: bool = False) -> None:
+    """Write rows to CSV file, with optional append mode."""
+    fieldnames = ["title", "ai_generated_abstract"]
+    file_exists = os.path.exists(path) and append
+    
+    mode = "a" if file_exists else "w"
+    with open(path, mode, encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
         writer.writerows(rows)
 
 # ================= OPENAI CALL =================
@@ -126,21 +130,23 @@ def extract_text(resp: Dict) -> str:
     return content
 
 # ================= GENERATION =================
-def generate_two_abstracts(title: str, api_key: str) -> Tuple[str, str]:
+def generate_abstracts(title: str, api_key: str, num_abstracts: int) -> List[str]:
+    """Generate N abstracts for a given title."""
     instructions = (
-        "Generate two abstracts for the given title.\n"
+        f"Generate {num_abstracts} abstracts for the given title.\n"
         "Do not try to imitate the human writing style.\n"
         "Each abstract must be written as one paragraph only.\n"
         "Each abstract must be between 150 and 200 words.\n"
     )
 
+    # Build schema dynamically
+    properties = {f"abstract_{i+1}": {"type": "string"} for i in range(num_abstracts)}
+    required = [f"abstract_{i+1}" for i in range(num_abstracts)]
+    
     schema = {
         "type": "object",
-        "properties": {
-            "abstract_1": {"type": "string"},
-            "abstract_2": {"type": "string"},
-        },
-        "required": ["abstract_1", "abstract_2"],
+        "properties": properties,
+        "required": required,
         "additionalProperties": False,
     }
 
@@ -153,68 +159,131 @@ def generate_two_abstracts(title: str, api_key: str) -> Tuple[str, str]:
         "response_format": {
             "type": "json_schema",
             "json_schema": {
-                "name": "abstract_pair",
+                "name": "abstracts",
                 "strict": True,
                 "schema": schema,
             }
         },
-        "max_tokens": 900,
+        "max_tokens": 450 * num_abstracts,
     }
 
     resp = call_openai(payload, api_key)
     data = json.loads(extract_text(resp))
 
-    a1 = normalize_ws(data["abstract_1"])
-    a2 = normalize_ws(data["abstract_2"])
+    abstracts = []
+    for i in range(num_abstracts):
+        key = f"abstract_{i+1}"
+        abstract = normalize_ws(data[key])
+        # Enforce max length locally
+        if word_count(abstract) > MAX_WC:
+            abstract = trim_to_words(abstract, TARGET_WC)
+        else:
+            abstract = normalize_ws(ensure_sentence_end(abstract))
+        abstracts.append(abstract)
 
-    # Enforce max length locally
-    a1 = trim_to_words(a1, TARGET_WC) if word_count(a1) > MAX_WC else normalize_ws(ensure_sentence_end(a1))
-    a2 = trim_to_words(a2, TARGET_WC) if word_count(a2) > MAX_WC else normalize_ws(ensure_sentence_end(a2))
+    return abstracts
 
-    return a1, a2
-
-def combine_same_cell(a1: str, a2: str) -> str:
-    """Combine two abstracts into one cell with a space between them."""
-    return f"{normalize_ws(ensure_sentence_end(a1))} {normalize_ws(a2)}"
+def combine_same_cell(abstracts: List[str]) -> str:
+    """Combine multiple abstracts into one cell with spaces between them."""
+    normalized = [normalize_ws(ensure_sentence_end(a)) for a in abstracts]
+    return " ".join(normalized)
 
 # ================= MAIN =================
 def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Generate AI abstracts for papers from CSV"
+    )
+    parser.add_argument(
+        "input_csv",
+        help="Input CSV file with paper titles"
+    )
+    parser.add_argument(
+        "-o", "--output",
+        help="Output CSV file (default: input filename with '_ai_abstracts' suffix)"
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=10,
+        help="Number of abstracts to generate before saving (default: 10)"
+    )
+    parser.add_argument(
+        "-n", "--num-abstracts",
+        type=int,
+        required=True,
+        help="Number of abstracts to generate per paper (required)"
+    )
+    args = parser.parse_args()
+    
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         print("ERROR: OPENAI_API_KEY not set", file=sys.stderr)
         return 2
 
-    input_rows = read_rows(INPUT_CSV)
+    input_csv = args.input_csv
+    if args.output:
+        output_csv = args.output
+    else:
+        base = os.path.splitext(input_csv)[0]
+        output_csv = f"{base}_ai_abstracts.csv"
+    
+    batch_size = args.batch_size
+    
+    input_rows = read_rows(input_csv)
     total = len(input_rows)
     if total == 0:
         print("No rows found in input CSV.", file=sys.stderr)
         return 1
 
-    out_rows: List[Dict[str, str]] = []
-
-    for i, row in enumerate(input_rows, 1):
+    # Remove existing file if it exists to start fresh
+    if os.path.exists(output_csv):
+        os.remove(output_csv)
+    
+    collected: List[Dict[str, str]] = []
+    total_saved = 0
+    count = 0
+    bar_length = 40
+    
+    print(f"Generating abstracts for {total} papers (saving every {batch_size} abstracts)...\n")
+    
+    for row in input_rows:
         title = (row.get("title") or "").strip()
+        count += 1
+        
+        # Show progress
+        percentage = (count / total) * 100
+        filled = int(bar_length * count / total)
+        bar = "█" * filled + "░" * (bar_length - filled)
+        print(f"\rProgress: [{bar}] {count}/{total} ({percentage:.1f}%)", end="", flush=True)
+        
         if not title:
-            out_rows.append({"title": "", "ai_generated_abstract": "ERROR: missing title"})
-            print(f"[{i}/{total}] SKIP missing title", file=sys.stderr)
-            continue
-
-        try:
-            a1, a2 = generate_two_abstracts(title, api_key)
-            combined = combine_same_cell(a1, a2)
-            out_rows.append({"title": title, "ai_generated_abstract": combined})
-            print(
-                f"[{i}/{total}] OK  WC1={word_count(a1)} WC2={word_count(a2)}",
-                file=sys.stderr,
-            )
-        except Exception as e:
-            out_rows.append({"title": title, "ai_generated_abstract": f"ERROR: {e}"})
-            print(f"[{i}/{total}] FAIL {e}", file=sys.stderr)
-
+            collected.append({"title": "", "ai_generated_abstract": "ERROR: missing title"})
+        else:
+            try:
+                abstracts = generate_abstracts(title, api_key, args.num_abstracts)
+                combined = combine_same_cell(abstracts)
+                collected.append({"title": title, "ai_generated_abstract": combined})
+            except Exception as e:
+                collected.append({"title": title, "ai_generated_abstract": f"ERROR: {e}"})
+        
+        # Save incrementally when batch size is reached
+        if len(collected) >= batch_size:
+            write_output(output_csv, collected, append=True)
+            total_saved += len(collected)
+            print(f" | Saved: {total_saved}")
+            collected = []
+        
         time.sleep(SLEEP_BETWEEN_REQUESTS)
-
-    write_output(OUTPUT_CSV, out_rows)
-    print(f"Saved: {OUTPUT_CSV}", file=sys.stderr)
+    
+    # Save any remaining abstracts
+    if collected:
+        write_output(output_csv, collected, append=True)
+        total_saved += len(collected)
+    
+    # Final progress bar
+    bar = "█" * bar_length
+    print(f"\rProgress: [{bar}] {count}/{total} (100.0%) | Saved: {total_saved}")
+    print(f"\nCompleted! Saved {total_saved} abstracts -> {output_csv}")
     return 0
 
 if __name__ == "__main__":

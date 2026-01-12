@@ -7,3 +7,6 @@ __pycache__/
 
 # Ignore environment variables
 .env
+
+# Ignore CSV files
+*.csv

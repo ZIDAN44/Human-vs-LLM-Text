@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import json
 import os
 import re
 import sys
 import time
-import requests
-from typing import List, Dict, Tuple
+import aiohttp
+import random
+from typing import List, Dict, Optional
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -22,7 +24,7 @@ ENDPOINT = "https://api.openai.com/v1/chat/completions"
 MIN_WC = 150
 MAX_WC = 200
 TARGET_WC = 170
-SLEEP_BETWEEN_REQUESTS = 0.1
+MAX_CONCURRENT_REQUESTS = 20  # Limit concurrent API calls
 
 # ================= HELPERS =================
 _word_re = re.compile(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)?")
@@ -79,46 +81,75 @@ def write_output(path: str, rows: List[Dict[str, str]], append: bool = False) ->
     file_exists = os.path.exists(path) and append
     
     mode = "a" if file_exists else "w"
-    with open(path, mode, encoding="utf-8", newline="") as f:
+    # Use utf-8-sig for Excel compatibility and proper Unicode handling
+    with open(path, mode, encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         if not file_exists:
             writer.writeheader()
         writer.writerows(rows)
 
-# ================= OPENAI CALL =================
-def call_openai(payload: Dict, api_key: str) -> Dict:
-    """Call OpenAI API with exponential backoff for rate limiting."""
-    backoff = 2
-    max_retries = 10
-    
-    for attempt in range(max_retries):
-        try:
-            r = requests.post(
-                ENDPOINT,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=60,
-            )
+# ================= ASYNC OPENAI CALL =================
+async def call_openai_async(
+    session: aiohttp.ClientSession,
+    payload: Dict,
+    api_key: str,
+    semaphore: asyncio.Semaphore
+) -> Dict:
+    async with semaphore:
+        backoff = 1.0
+        max_backoff = 60.0
+        max_retries = 10
 
-            if r.status_code == 429:
-                print(f"[429] Rate limited. Waiting {backoff}s...", file=sys.stderr)
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 60)
-                continue
+        for attempt in range(max_retries):
+            try:
+                async with session.post(
+                    ENDPOINT,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=60),
+                ) as resp:
+                    # Handle rate limiting with server guidance if present
+                    if resp.status == 429:
+                        #print("429 headers:", dict(resp.headers), file=sys.stderr)
+                        
+                        retry_after = resp.headers.get("Retry-After")
+                        if retry_after is not None:
+                            wait_time = float(retry_after)
+                        else:
+                            wait_time = min(backoff, max_backoff)
 
-            r.raise_for_status()
-            return r.json()
-        except requests.exceptions.RequestException as e:
-            if attempt == max_retries - 1:
-                raise RuntimeError(f"API call failed after {max_retries} attempts: {e}") from e
-            print(f"Request failed, retrying in {backoff}s...", file=sys.stderr)
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 60)
-    
-    raise RuntimeError("Too many rate-limit retries.")
+                        # Add a little jitter to avoid thundering herd
+                        wait_time *= (0.8 + 0.4 * random.random())
+
+                        print(f"[429] Rate limited. Waiting {wait_time:.1f}s...", file=sys.stderr)
+                        await asyncio.sleep(wait_time)
+                        backoff = min(backoff * 2, max_backoff)
+                        continue
+
+                    # Retry transient server errors
+                    if resp.status in (500, 502, 503, 504):
+                        wait_time = min(backoff, max_backoff) * (0.8 + 0.4 * random.random())
+                        text = await resp.text()
+                        print(f"[{resp.status}] Server error. Retrying in {wait_time:.1f}s... Body: {text[:200]}", file=sys.stderr)
+                        await asyncio.sleep(wait_time)
+                        backoff = min(backoff * 2, max_backoff)
+                        continue
+
+                    resp.raise_for_status()
+                    return await resp.json()
+
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                if attempt == max_retries - 1:
+                    raise RuntimeError(f"API call failed after {max_retries} attempts: {e}") from e
+                wait_time = min(backoff, max_backoff) * (0.8 + 0.4 * random.random())
+                print(f"Request failed ({type(e).__name__}), retrying in {wait_time:.1f}s...", file=sys.stderr)
+                await asyncio.sleep(wait_time)
+                backoff = min(backoff * 2, max_backoff)
+
+        raise RuntimeError("Too many retries.")
 
 def extract_text(resp: Dict) -> str:
     """Extract text from OpenAI API response."""
@@ -129,9 +160,14 @@ def extract_text(resp: Dict) -> str:
         raise RuntimeError("No text returned from model.")
     return content
 
-# ================= GENERATION =================
-def generate_single_abstract(title: str, api_key: str) -> str:
-    """Generate a single abstract for a given title."""
+# ================= ASYNC GENERATION =================
+async def generate_single_abstract_async(
+    session: aiohttp.ClientSession,
+    title: str,
+    api_key: str,
+    semaphore: asyncio.Semaphore
+) -> str:
+    """Generate a single abstract for a given title asynchronously."""
     instructions = (
         "Generate 1 abstract for the given title.\n"
         "Do not try to imitate the human writing style.\n"
@@ -165,10 +201,14 @@ def generate_single_abstract(title: str, api_key: str) -> str:
         "max_tokens": 450,
     }
 
-    resp = call_openai(payload, api_key)
-    data = json.loads(extract_text(resp))
+    resp = await call_openai_async(session, payload, api_key, semaphore)
+    # Ensure proper UTF-8 handling when parsing JSON
+    content = extract_text(resp)
+    data = json.loads(content, strict=False)
     
-    abstract = normalize_ws(data["abstract"])
+    # Ensure abstract is properly decoded as Unicode string
+    abstract = str(data["abstract"])
+    abstract = normalize_ws(abstract)
     # Enforce max length locally
     if word_count(abstract) > MAX_WC:
         abstract = trim_to_words(abstract, TARGET_WC)
@@ -177,23 +217,90 @@ def generate_single_abstract(title: str, api_key: str) -> str:
     
     return abstract
 
-def generate_abstracts(title: str, api_key: str, num_abstracts: int) -> List[str]:
-    """Generate N abstracts for a given title, each from a separate API call."""
-    abstracts = []
-    for i in range(num_abstracts):
-        abstract = generate_single_abstract(title, api_key)
-        abstracts.append(abstract)
-        # Sleep between requests to avoid rate limiting
-        if i < num_abstracts - 1:  # Don't sleep after the last one
-            time.sleep(SLEEP_BETWEEN_REQUESTS)
-    return abstracts
+async def generate_abstracts_async(
+    session: aiohttp.ClientSession,
+    title: str,
+    api_key: str,
+    num_abstracts: int,
+    semaphore: asyncio.Semaphore
+) -> List[str]:
+    """Generate N abstracts for a given title concurrently."""
+    tasks = [
+        generate_single_abstract_async(session, title, api_key, semaphore)
+        for _ in range(num_abstracts)
+    ]
+    return await asyncio.gather(*tasks)
 
 def combine_same_cell(abstracts: List[str]) -> str:
     """Combine multiple abstracts into one cell with spaces between them."""
     normalized = [normalize_ws(ensure_sentence_end(a)) for a in abstracts]
     return " ".join(normalized)
 
-# ================= MAIN =================
+# ================= ASYNC MAIN =================
+async def process_paper(
+    session: aiohttp.ClientSession,
+    title: str,
+    api_key: str,
+    num_abstracts: int,
+    semaphore: asyncio.Semaphore
+) -> Dict[str, str]:
+    """Process a single paper and return result dictionary."""
+    if not title:
+        return {"title": "", "ai_generated_abstract": "ERROR: missing title"}
+    
+    try:
+        abstracts = await generate_abstracts_async(
+            session, title, api_key, num_abstracts, semaphore
+        )
+        combined = combine_same_cell(abstracts)
+        return {"title": title, "ai_generated_abstract": combined}
+    except Exception as e:
+        return {"title": title, "ai_generated_abstract": f"ERROR: {e}"}
+
+async def process_papers_async(
+    input_rows: List[Dict[str, str]],
+    api_key: str,
+    num_abstracts: int,
+    output_csv: str,
+    batch_size: int,
+    max_concurrent: int
+) -> None:
+    """Process all papers asynchronously with batching."""
+    semaphore = asyncio.Semaphore(max_concurrent)
+    total = len(input_rows)
+    collected: List[Dict[str, str]] = []
+    total_saved = 0
+    bar_length = 40
+    
+    async with aiohttp.ClientSession() as session:
+        # Process papers in batches to manage memory and progress updates
+        for batch_start in range(0, total, batch_size):
+            batch_end = min(batch_start + batch_size, total)
+            batch_rows = input_rows[batch_start:batch_end]
+            
+            # Create tasks for all papers in this batch
+            tasks = [
+                process_paper(session, (row.get("title") or "").strip(), api_key, num_abstracts, semaphore)
+                for row in batch_rows
+            ]
+            
+            # Execute all tasks concurrently
+            results = await asyncio.gather(*tasks)
+            collected.extend(results)
+            
+            # Save results
+            write_output(output_csv, collected, append=True)
+            total_saved += len(collected)
+            
+            # Update progress
+            count = batch_end
+            percentage = (count / total) * 100
+            filled = int(bar_length * count / total)
+            bar = "█" * filled + "░" * (bar_length - filled)
+            print(f"\rProgress: [{bar}] {count}/{total} ({percentage:.1f}%) | Saved: {total_saved}", end="", flush=True)
+            
+            collected = []
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Generate AI abstracts for papers from CSV"
@@ -209,14 +316,20 @@ def main() -> int:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=10,
-        help="Number of abstracts to generate before saving (default: 10)"
+        default=50,
+        help="Number of papers to process before saving (default: 50)"
     )
     parser.add_argument(
         "-n", "--num-abstracts",
         type=int,
         required=True,
         help="Number of abstracts to generate per paper (required)"
+    )
+    parser.add_argument(
+        "--max-concurrent",
+        type=int,
+        default=MAX_CONCURRENT_REQUESTS,
+        help=f"Maximum concurrent API requests (default: {MAX_CONCURRENT_REQUESTS})"
     )
     args = parser.parse_args()
     
@@ -244,51 +357,29 @@ def main() -> int:
     if os.path.exists(output_csv):
         os.remove(output_csv)
     
-    collected: List[Dict[str, str]] = []
-    total_saved = 0
-    count = 0
-    bar_length = 40
+    print(f"Generating abstracts for {total} papers (saving every {batch_size} papers)...")
+    print(f"Using {args.max_concurrent} concurrent requests for faster processing.\n")
     
-    print(f"Generating abstracts for {total} papers (saving every {batch_size} abstracts)...\n")
+    start_time = time.time()
     
-    for row in input_rows:
-        title = (row.get("title") or "").strip()
-        count += 1
-        
-        # Show progress
-        percentage = (count / total) * 100
-        filled = int(bar_length * count / total)
-        bar = "█" * filled + "░" * (bar_length - filled)
-        print(f"\rProgress: [{bar}] {count}/{total} ({percentage:.1f}%)", end="", flush=True)
-        
-        if not title:
-            collected.append({"title": "", "ai_generated_abstract": "ERROR: missing title"})
-        else:
-            try:
-                abstracts = generate_abstracts(title, api_key, args.num_abstracts)
-                combined = combine_same_cell(abstracts)
-                collected.append({"title": title, "ai_generated_abstract": combined})
-            except Exception as e:
-                collected.append({"title": title, "ai_generated_abstract": f"ERROR: {e}"})
-        
-        # Save incrementally when batch size is reached
-        if len(collected) >= batch_size:
-            write_output(output_csv, collected, append=True)
-            total_saved += len(collected)
-            print(f" | Saved: {total_saved}")
-            collected = []
-        
-        time.sleep(SLEEP_BETWEEN_REQUESTS)
+    try:
+        asyncio.run(process_papers_async(
+            input_rows, api_key, args.num_abstracts, output_csv, batch_size, args.max_concurrent
+        ))
+    except KeyboardInterrupt:
+        print("\n\nInterrupted by user. Partial results saved.", file=sys.stderr)
+        return 130
+    except Exception as e:
+        print(f"\n\nError: {e}", file=sys.stderr)
+        return 1
     
-    # Save any remaining abstracts
-    if collected:
-        write_output(output_csv, collected, append=True)
-        total_saved += len(collected)
+    elapsed = time.time() - start_time
     
     # Final progress bar
-    bar = "█" * bar_length
-    print(f"\rProgress: [{bar}] {count}/{total} (100.0%) | Saved: {total_saved}")
-    print(f"\nCompleted! Saved {total_saved} abstracts -> {output_csv}")
+    bar = "█" * 40
+    print(f"\rProgress: [{bar}] {total}/{total} (100.0%)")
+    print(f"\nCompleted! Saved {total} abstracts -> {output_csv}")
+    print(f"Time elapsed: {elapsed:.1f}s ({elapsed/60:.1f} minutes)")
     return 0
 
 if __name__ == "__main__":
